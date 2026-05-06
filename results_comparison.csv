@@ -1,0 +1,7 @@
+Algorithm,avg_waiting_time_min,completion_rate_pct,utilisation_pct,load_variance_kw2,energy_cost_inr,n_completed,n_dropped
+FIFO,3.55,67.27,29.04,4468.47,11085.09,37,18
+SJF,21.03,56.9,28.74,4491.11,11678.47,33,25
+EDF,8.82,63.64,27.67,4425.11,10012.68,35,20
+LLF,10.78,67.24,27.21,4326.91,9673.96,39,19
+Priority,15.27,69.64,29.22,4526.09,11610.42,39,17
+DQN,10.78,67.24,27.21,4326.91,9673.96,39,19
