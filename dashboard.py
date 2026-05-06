@@ -23,6 +23,14 @@ from evaluation  import compare_all
 from data_loader import load_sessions
 from ml_prediction import run_ml_pipeline
 
+@st.cache_data(show_spinner=False)
+def _cached_synthetic(n_sessions, seed):
+    return make_synthetic_sessions(n=n_sessions, n_steps=288, seed=seed)
+
+@st.cache_data(show_spinner=False)
+def _cached_local(local_file, site_choice):
+    return load_sessions(local_file, site=site_choice, verbose=False)
+
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -60,9 +68,9 @@ power_cap   = st.sidebar.slider("Power cap (kW)", 50, 300, 150, 10)
 v2g_enabled = st.sidebar.checkbox("Enable V2G Discharging", value=False)
 
 st.sidebar.subheader("RL Training")
-n_episodes  = st.sidebar.slider("Training episodes", 50, 300, 50, 50)
+n_episodes  = st.sidebar.slider("Training episodes", 10, 300, 30, 10)
 run_tabular = st.sidebar.checkbox("Include Tabular Q-learning", value=False)
-run_dqn     = st.sidebar.checkbox("Include DQN Agent", value=True)
+run_dqn     = st.sidebar.checkbox("Include DQN Agent", value=False)
 seed        = st.sidebar.number_input("Random seed", value=42, step=1)
 
 run_btn = st.sidebar.button("▶ Run Simulation", type="primary")
@@ -80,86 +88,97 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "ℹ️ About",
 ])
 
-if run_btn or "results" not in st.session_state:
-    with st.spinner("Loading data & running simulations..."):
-        
-        # 1. Data loading
-        if data_source == "Synthetic":
-            sessions, n_steps = make_synthetic_sessions(
-                n=n_sessions, n_steps=288, seed=int(seed))
-        else:
-            try:
-                sessions, n_steps = load_sessions(local_file, site=site_choice, verbose=False)
-            except Exception as e:
-                st.error(f"Failed to load local file: {e}")
-                st.stop()
+if "results" not in st.session_state:
+    st.info("👈 Configure settings in the sidebar, then click **▶ Run Simulation** to start.")
 
-        # 2. Train agents
-        q_agent = None
-        dqn_agent = None
-        
-        def sim_factory():
-            return ChargingSimulator(sessions, n_ports=n_ports,
-                                     power_cap=power_cap, v2g_enabled=v2g_enabled)
+if run_btn:
+    progress_bar = st.progress(0, text="Loading data...")
+    
+    # 1. Data loading
+    if data_source == "Synthetic":
+        sessions, n_steps = _cached_synthetic(n_sessions, int(seed))
+    else:
+        try:
+            sessions, n_steps = _cached_local(local_file, site_choice)
+        except Exception as e:
+            st.error(f"Failed to load local file: {e}")
+            st.stop()
+    
+    progress_bar.progress(15, text="Data loaded. Setting up simulator...")
 
-        if run_tabular:
-            q_agent = QLearningAgent(alpha=0.1, gamma=0.95,
-                                   epsilon=1.0, eps_min=0.01,
-                                   eps_decay=0.995, seed=int(seed))
-            q_agent.train(sim_factory, n_episodes=n_episodes, verbose=False)
+    # 2. Train agents
+    q_agent = None
+    dqn_agent = None
+    
+    def sim_factory():
+        return ChargingSimulator(sessions, n_ports=n_ports,
+                                 power_cap=power_cap, v2g_enabled=v2g_enabled)
 
-        if run_dqn:
-            dqn_agent = DQNAgent(seed=int(seed))
-            dqn_agent.train(sim_factory, n_episodes=n_episodes, verbose=False)
+    if run_tabular:
+        progress_bar.progress(20, text="Training Tabular Q-learning agent...")
+        q_agent = QLearningAgent(alpha=0.1, gamma=0.95,
+                               epsilon=1.0, eps_min=0.01,
+                               eps_decay=0.995, seed=int(seed))
+        q_agent.train(sim_factory, n_episodes=n_episodes, verbose=False)
 
-        # 3. Evaluate algorithms
-        df_metrics, histories = compare_all(
-            sessions, q_agent=q_agent, dqn_agent=dqn_agent,
-            n_ports=n_ports, power_cap=power_cap, v2g_enabled=v2g_enabled)
+    if run_dqn:
+        progress_bar.progress(30, text="Training DQN agent (this may take a moment)...")
+        dqn_agent = DQNAgent(seed=int(seed))
+        dqn_agent.train(sim_factory, n_episodes=n_episodes, verbose=False)
 
-        # 4. ML Predictions
-        ml_results = run_ml_pipeline(sessions)
+    # 3. Evaluate algorithms
+    progress_bar.progress(70, text="Evaluating all algorithms...")
+    df_metrics, histories = compare_all(
+        sessions, q_agent=q_agent, dqn_agent=dqn_agent,
+        n_ports=n_ports, power_cap=power_cap, v2g_enabled=v2g_enabled)
 
-        # 5. Ablation Study
-        # Run base algorithm (FIFO) with different constraints
-        base_fn = get_scheduler("FIFO")
-        
-        sim_unconstrained = ChargingSimulator(sessions, n_ports=n_ports, power_cap=9999.0, v2g_enabled=False)
-        obs = sim_unconstrained.reset()
-        done = False
-        while not done:
-            _, _, done, _ = sim_unconstrained.step(base_fn)
-        ablation_metrics_unconstrained = sim_unconstrained.get_metrics()
-        
-        sim_no_v2g = ChargingSimulator(sessions, n_ports=n_ports, power_cap=power_cap, v2g_enabled=False)
-        obs = sim_no_v2g.reset()
-        done = False
-        while not done:
-            _, _, done, _ = sim_no_v2g.step(base_fn)
-        ablation_metrics_nov2g = sim_no_v2g.get_metrics()
-        
-        sim_v2g = ChargingSimulator(sessions, n_ports=n_ports, power_cap=power_cap, v2g_enabled=True)
-        obs = sim_v2g.reset()
-        done = False
-        while not done:
-            _, _, done, _ = sim_v2g.step(base_fn)
-        ablation_metrics_v2g = sim_v2g.get_metrics()
+    # 4. ML Predictions
+    progress_bar.progress(80, text="Running ML prediction pipeline...")
+    ml_results = run_ml_pipeline(sessions)
 
-        ablation_df = pd.DataFrame([
-            {"Variant": "No Power Cap", **ablation_metrics_unconstrained},
-            {"Variant": "With Power Cap (No V2G)", **ablation_metrics_nov2g},
-            {"Variant": "With Power Cap & V2G", **ablation_metrics_v2g},
-        ]).set_index("Variant")
+    # 5. Ablation Study
+    progress_bar.progress(90, text="Running ablation study...")
+    base_fn = get_scheduler("FIFO")
+    
+    sim_unconstrained = ChargingSimulator(sessions, n_ports=n_ports, power_cap=9999.0, v2g_enabled=False)
+    obs = sim_unconstrained.reset()
+    done = False
+    while not done:
+        _, _, done, _ = sim_unconstrained.step(base_fn)
+    ablation_metrics_unconstrained = sim_unconstrained.get_metrics()
+    
+    sim_no_v2g = ChargingSimulator(sessions, n_ports=n_ports, power_cap=power_cap, v2g_enabled=False)
+    obs = sim_no_v2g.reset()
+    done = False
+    while not done:
+        _, _, done, _ = sim_no_v2g.step(base_fn)
+    ablation_metrics_nov2g = sim_no_v2g.get_metrics()
+    
+    sim_v2g = ChargingSimulator(sessions, n_ports=n_ports, power_cap=power_cap, v2g_enabled=True)
+    obs = sim_v2g.reset()
+    done = False
+    while not done:
+        _, _, done, _ = sim_v2g.step(base_fn)
+    ablation_metrics_v2g = sim_v2g.get_metrics()
 
-        # Save to session state
-        st.session_state["sessions"]         = sessions
-        st.session_state["results"]          = df_metrics
-        st.session_state["histories"]        = histories
-        st.session_state["q_agent"]          = q_agent
-        st.session_state["dqn_agent"]        = dqn_agent
-        st.session_state["power_cap"]        = power_cap
-        st.session_state["ml_results"]       = ml_results
-        st.session_state["ablation_df"]      = ablation_df
+    ablation_df = pd.DataFrame([
+        {"Variant": "No Power Cap", **ablation_metrics_unconstrained},
+        {"Variant": "With Power Cap (No V2G)", **ablation_metrics_nov2g},
+        {"Variant": "With Power Cap & V2G", **ablation_metrics_v2g},
+    ]).set_index("Variant")
+
+    # Save to session state
+    st.session_state["sessions"]         = sessions
+    st.session_state["results"]          = df_metrics
+    st.session_state["histories"]        = histories
+    st.session_state["q_agent"]          = q_agent
+    st.session_state["dqn_agent"]        = dqn_agent
+    st.session_state["power_cap"]        = power_cap
+    st.session_state["ml_results"]       = ml_results
+    st.session_state["ablation_df"]      = ablation_df
+
+    progress_bar.progress(100, text="Done! ✅")
+    st.success("Simulation complete! View results in the tabs above.")
 
 
 # ── Tab 1: Metrics comparison ─────────────────────────────────────────────────
@@ -198,10 +217,11 @@ with tab1:
                 fig, ax = plt.subplots(figsize=(5, 3.5))
                 vals  = df[col_name]
                 bars  = ax.bar(
-                    vals.index, vals.values,
+                    range(len(vals)), vals.values,
                     color=[COLORS.get(n, "#888") for n in vals.index],
                     edgecolor="black", linewidth=0.6)
                 ax.set_title(title, fontsize=10, fontweight="bold")
+                ax.set_xticks(range(len(vals)))
                 ax.set_xticklabels(vals.index, rotation=45, ha='right', fontsize=8)
                 ax.grid(axis="y", alpha=0.3)
                 for bar, v in zip(bars, vals.values):
@@ -349,14 +369,16 @@ with tab5:
         
         # Plot Cost
         vals = ablation_df["energy_cost_inr"]
-        axes[0].bar(vals.index, vals.values, color=["#E24A33", "#348ABD", "#988ED5"])
+        axes[0].bar(range(len(vals)), vals.values, color=["#E24A33", "#348ABD", "#988ED5"])
         axes[0].set_title("Energy Cost Comparison (Rs.)")
+        axes[0].set_xticks(range(len(vals)))
         axes[0].set_xticklabels(vals.index, rotation=15)
         
         # Plot Variance
         vals = ablation_df["load_variance_kw2"]
-        axes[1].bar(vals.index, vals.values, color=["#E24A33", "#348ABD", "#988ED5"])
+        axes[1].bar(range(len(vals)), vals.values, color=["#E24A33", "#348ABD", "#988ED5"])
         axes[1].set_title("Load Variance (kW²)")
+        axes[1].set_xticks(range(len(vals)))
         axes[1].set_xticklabels(vals.index, rotation=15)
         
         plt.tight_layout()
